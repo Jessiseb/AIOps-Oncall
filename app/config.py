@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     rag_top_k: int = 3
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
 
+    # DeepSeek 配置（OpenAI 兼容协议）
+    deepseek_api_key: str = ""  # 官方平台 https://platform.deepseek.com/ 申请
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_chat_model: str = "deepseek-chat"  # deepseek-chat(V3) / deepseek-reasoner(R1)
+
+    # RAG 生成模型提供商：dashscope（qwen，默认）/ deepseek
+    rag_llm_provider: str = "deepseek"
+
     # RAG 二阶段重排配置（阿里云百炼 TextReRank）
     rag_rerank_enabled: bool = True  # 总开关；重排失败时不降级、直接报错
     rag_rerank_model: str = "gte-rerank-v2"  # 百炼平台重排模型

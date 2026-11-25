@@ -1,7 +1,9 @@
 """RAG Agent 服务 - 基于 LangGraph 的智能代理
 
-使用 langchain_qwq 的 ChatQwen 原生集成，
-支持真正的流式输出和更好的模型适配。
+支持两种生成模型提供商（由 RAG_LLM_PROVIDER 配置切换）：
+- dashscope: langchain_qwq 的 ChatQwen 原生集成（qwen 系列）
+- deepseek:  标准的 ChatOpenAI + DeepSeek 官方 OpenAI 兼容 API
+两者都支持流式输出。
 """
 
 from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
@@ -17,6 +19,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from loguru import logger
 from typing_extensions import TypedDict
+from langchain_openai import ChatOpenAI
 from langchain_qwq import ChatQwen
 
 from app.config import config
@@ -74,7 +77,7 @@ def trim_messages_middleware(state: AgentState) -> dict[str, Any] | None:
 
 
 class RagAgentService:
-    """RAG Agent 服务 - 使用 LangGraph + ChatQwen 原生集成"""
+    """RAG Agent 服务 - LangGraph + 可切换提供商的生成模型"""
 
     def __init__(self, streaming: bool = True):
         """初始化 RAG Agent 服务
@@ -82,17 +85,34 @@ class RagAgentService:
         Args:
             streaming: 是否启用流式输出，默认为 True
         """
-        self.model_name = config.rag_model
         self.streaming = streaming
         self.system_prompt = self._build_system_prompt()
 
-
-        self.model = ChatQwen(
-            model=self.model_name,
-            api_key=config.dashscope_api_key,
-            temperature=0.7,
-            streaming=streaming,
-        )
+        # 按配置选择生成模型提供商
+        self.provider = config.rag_llm_provider.lower()
+        if self.provider == "deepseek":
+            if not config.deepseek_api_key:
+                raise ValueError(
+                    "RAG_LLM_PROVIDER=deepseek 但未配置 DEEPSEEK_API_KEY，"
+                    "请在 .env 中填入（申请地址 https://platform.deepseek.com/）"
+                )
+            self.model_name = config.deepseek_chat_model
+            self.model = ChatOpenAI(
+                model=self.model_name,
+                api_key=config.deepseek_api_key,
+                base_url=config.deepseek_base_url,
+                temperature=0.7,
+                streaming=streaming,
+            )
+        else:
+            # 默认走 DashScope qwen（原行为）
+            self.model_name = config.rag_model
+            self.model = ChatQwen(
+                model=self.model_name,
+                api_key=config.dashscope_api_key,
+                temperature=0.7,
+                streaming=streaming,
+            )
 
         # 定义基础工具
         self.tools = [retrieve_knowledge, get_current_time]
@@ -107,7 +127,10 @@ class RagAgentService:
         self.agent = None
         self._agent_initialized = False
 
-        logger.info(f"RAG Agent 服务初始化完成 (ChatQwen), model={self.model_name}, streaming={streaming}")
+        logger.info(
+            f"RAG Agent 服务初始化完成 (provider={self.provider}, "
+            f"model={self.model_name}, streaming={streaming})"
+        )
 
     async def _initialize_agent(self):
         """异步初始化 Agent（包括 MCP 工具）"""
@@ -279,18 +302,30 @@ class RagAgentService:
                 message_type = type(token).__name__
 
                 if message_type in ("AIMessage", "AIMessageChunk"):
+                    # 优先读 ChatQwen 特有的 content_blocks（qwen 扩展思考结构），
+                    # 没有则读标准 content（ChatOpenAI / DeepSeek 走这条）。
+                    # content 可能是 str（绝大多数场景）或 list[dict]（多块内容），都做兼容
                     content_blocks = getattr(token, 'content_blocks', None)
+                    text_content = ""
 
                     if content_blocks and isinstance(content_blocks, list):
                         for block in content_blocks:
                             if isinstance(block, dict) and block.get('type') == 'text':
-                                text_content = block.get('text', '')
-                                if text_content:
-                                    yield {
-                                        "type": "content",
-                                        "data": text_content,
-                                        "node": node_name
-                                    }
+                                text_content += block.get('text', '')
+                    elif isinstance(token.content, str):
+                        text_content = token.content
+                    elif isinstance(token.content, list):
+                        # 标准 content 的多块形式：拼接其中 text 块
+                        for block in token.content:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                text_content += block.get('text', '')
+
+                    if text_content:
+                        yield {
+                            "type": "content",
+                            "data": text_content,
+                            "node": node_name
+                        }
 
             logger.info(f"[会话 {session_id}] RAG Agent 查询完成（流式）")
             yield {"type": "complete"}
