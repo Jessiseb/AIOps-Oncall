@@ -173,10 +173,18 @@ const API = {
 /* ============ 常量 ============ */
 const MODE_NAMES = { quick: '快速响应', stream: '流式推理' };
 const QUICK_COMMANDS = [
-    { icon: 'book', label: '知识库检索', text: '帮我检索一下告警处理的常用方案' },
-    { icon: 'alert', label: '告警分析', text: 'CPU 使用率过高应该怎么排查？' },
-    { icon: 'terminal', label: '日志诊断', text: '服务 5xx 错误率上升，从哪些日志入手？' },
-    { icon: 'doc', label: '运维规范', text: '线上故障的升级流程是什么？' }
+    { num: '01', label: '知识库检索', text: '帮我检索一下告警处理的常用方案' },
+    { num: '02', label: '告警分析', text: 'CPU 使用率过高应该怎么排查？' },
+    { num: '03', label: '日志诊断', text: '服务 5xx 错误率上升，从哪些日志入手？' },
+    { num: '04', label: '运维规范', text: '线上故障的升级流程是什么？' }
+];
+/* 告警跑马灯内容：模拟值班状态流（纯前端氛围，不请求后端） */
+const TICKER_ITEMS = [
+    '值班响应 24/7',
+    'RAG 知识库索引已就绪',
+    'MCP 日志与监控数据已接入',
+    '智能诊断引擎（Plan-Execute-Replan）运行中',
+    '故障平均处理时长目标 15 分钟以内'
 ];
 
 /* ============ Markdown 渲染组件（v-html + 高亮 + 自动滚动） ============ */
@@ -671,7 +679,7 @@ const App = {
             messages, inputText, currentMode, isBusy, sessionId,
             chatHistories, notifications, clock, health, overlay,
             modeMenuOpen, toolsMenuOpen, fileInputEl, msgListEl,
-            hasMessages, modeName, healthDotClass, healthLabel, QUICK_COMMANDS,
+            hasMessages, modeName, healthDotClass, healthLabel, QUICK_COMMANDS, TICKER_ITEMS,
             sendMessage, newChat, runDiagnosis, openHistory, deleteHistory,
             triggerUpload, onFileChange, useCommand,
             fmtTime
@@ -679,27 +687,32 @@ const App = {
     },
     template: `
     <div class="app-shell">
+        <div class="paper-grain"></div>
+
+        <!-- ========== 警示胶带条（纯前端氛围） ========== -->
+        <div class="ticker">
+            <div class="ticker-tag">运营公告</div>
+            <div class="ticker-track ticker-move">
+                <template v-for="(item, i) in [...TICKER_ITEMS, ...TICKER_ITEMS]" :key="i">
+                    <span>{{ item }}</span><span class="sep">/</span>
+                </template>
+            </div>
+        </div>
 
         <!-- ========== 顶栏 ========== -->
         <header class="topbar">
             <div class="topbar-brand">
-                <div class="brand-mark">
-                    <svg viewBox="0 0 100 100">
-                        <path d="M50 18 L58 42 L82 50 L58 58 L50 82 L42 58 L18 50 L42 42 Z" fill="currentColor"/>
-                    </svg>
-                </div>
-                <div class="brand-text">
-                    <div class="brand-name">OnCall <span>Command Center</span></div>
-                    <div class="brand-sub">智能运维指挥中心 · RAG 知识问答 / AIOps 根因诊断</div>
-                </div>
+                <div class="brand-mark">OC</div>
+                <div class="brand-name">OnCall <span>智能运维平台</span></div>
+                <div class="brand-sub">RAG 知识问答 · AIOps 根因诊断</div>
             </div>
 
             <div class="topbar-status">
                 <div class="status-pill" :class="'pill-' + healthDotClass">
                     <span class="status-dot"></span>
                     <span class="status-label">{{ healthLabel }}</span>
-                    <span class="status-meta" v-if="health.milvus === 'connected'">Milvus ✓</span>
-                    <span class="status-meta warn" v-else-if="health.state === 'unhealthy'">Milvus ✕</span>
+                    <span class="status-meta" v-if="health.milvus === 'connected'">MILVUS OK</span>
+                    <span class="status-meta warn" v-else-if="health.state === 'unhealthy'">MILVUS FAIL</span>
                 </div>
                 <div class="topbar-clock" title="当前时间">{{ clock }}</div>
             </div>
@@ -715,7 +728,7 @@ const App = {
 
                 <button class="btn-diagnose" @click="runDiagnosis" :disabled="isBusy">
                     <svg viewBox="0 0 24 24"><path d="M3 12h4l2-7 4 14 2-7h6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
-                    <span>一键根因诊断</span>
+                    <span>根因诊断</span>
                     <span class="btn-tag">AIOps</span>
                 </button>
 
@@ -724,7 +737,6 @@ const App = {
                     <div class="history-list">
                         <div v-if="!chatHistories.length" class="history-empty">暂无历史会话</div>
                         <div v-for="h in chatHistories" :key="h.id" class="history-item" :class="{ active: h.id === sessionId }" @click="openHistory(h)">
-                            <svg class="hi-icon" viewBox="0 0 24 24"><path d="M4 5h16v14H8l-4 4V5z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/></svg>
                             <span class="hi-title">{{ h.title }}</span>
                             <button class="hi-delete" @click.stop="deleteHistory(h)" title="删除">
                                 <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -734,33 +746,28 @@ const App = {
                 </div>
 
                 <div class="sidebar-foot">
-                    <div class="foot-row"><span>SESSION</span><code>{{ sessionId.slice(-10) }}</code></div>
-                    <div class="foot-row"><span>ENGINE</span><code>LangGraph + RAG</code></div>
+                    <div class="foot-row"><span>SESSION</span><code>{{ sessionId.slice(-8).toUpperCase() }}</code></div>
+                    <div class="foot-row"><span>ENGINE</span><code>RAG+PER</code></div>
                 </div>
             </aside>
 
             <!-- ========== 主区 ========== -->
             <main class="main-pane">
-                <!-- 空状态：欢迎屏 -->
+                <!-- 空状态：终端引导屏 -->
                 <div v-if="!hasMessages" class="welcome">
                     <div class="welcome-grid-bg"></div>
                     <div class="welcome-inner">
-                        <div class="welcome-eyebrow">SYSTEM READY</div>
-                        <h1 class="welcome-title">有什么告警，直接说。</h1>
-                        <p class="welcome-desc">知识库检索 · 日志分析 · 根因定位 —— 输入问题或触发一次自动诊断。</p>
+                        <div class="welcome-eyebrow">智能运维平台 · 系统就绪</div>
+                        <h1 class="welcome-title">您好，<br>请问需要<em>什么支持？</em></h1>
+                        <p class="welcome-desc">支持 RAG 知识检索、日志与监控数据联动查询、以及基于 Plan-Execute-Replan 的自动根因诊断。</p>
                         <div class="cmd-grid">
                             <button v-for="c in QUICK_COMMANDS" :key="c.label" class="cmd-card" @click="useCommand(c)">
-                                <div class="cmd-icon">
-                                    <svg v-if="c.icon === 'book'" viewBox="0 0 24 24"><path d="M4 4h7v16H4zM13 4h7v16h-7z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/></svg>
-                                    <svg v-else-if="c.icon === 'alert'" viewBox="0 0 24 24"><path d="M12 3l10 18H2L12 3z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/><path d="M12 10v5M12 17.5v.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-                                    <svg v-else-if="c.icon === 'terminal'" viewBox="0 0 24 24"><path d="M4 5h16v14H4z" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M7 9l3 3-3 3M12 15h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-                                    <svg v-else viewBox="0 0 24 24"><path d="M6 2h9l5 5v15H6V2z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/><path d="M15 2v5h5" stroke="currentColor" stroke-width="1.8" fill="none"/></svg>
-                                </div>
+                                <span class="cmd-num">{{ c.num }}</span>
                                 <div class="cmd-text">
                                     <div class="cmd-label">{{ c.label }}</div>
                                     <div class="cmd-desc">{{ c.text }}</div>
                                 </div>
-                                <svg class="cmd-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+                                <span class="cmd-run">查询 →</span>
                             </button>
                         </div>
                     </div>
@@ -775,14 +782,12 @@ const App = {
                             <div class="bubble-user">
                                 <div class="bubble-user-text">{{ m.content }}</div>
                             </div>
-                            <div class="msg-meta user-meta">{{ fmtTime(m.ts) }}</div>
+                            <div class="msg-meta user-meta">报修人 · {{ fmtTime(m.ts) }}</div>
                         </template>
 
-                        <!-- 助手消息 -->
+                        <!-- 机器消息 -->
                         <template v-else>
-                            <div class="bot-avatar" :class="{ 'bot-avatar-aiops': m.type === 'aiops' }">
-                                <svg viewBox="0 0 100 100"><path d="M50 18 L58 42 L82 50 L58 58 L50 82 L42 58 L18 50 L42 42 Z" fill="currentColor"/></svg>
-                            </div>
+                            <div class="bot-avatar" :class="{ 'bot-avatar-aiops': m.type === 'aiops' }">OP</div>
                             <div class="bot-body">
 
                                 <!-- 加载态 -->
@@ -791,7 +796,7 @@ const App = {
                                     <span class="dot-anim"><i></i><i></i><i></i></span>
                                 </div>
 
-                                <!-- AIOps 诊断卡片 -->
+                                <!-- AIOps 诊断报告 -->
                                 <template v-else-if="m.type === 'aiops'">
                                     <div class="diag-card">
                                         <div class="diag-card-head">
@@ -799,7 +804,7 @@ const App = {
                                                 <span class="diag-badge">AIOps</span>
                                                 <span>自动根因诊断</span>
                                                 <span class="diag-state" v-if="m.diagRunning">RUNNING</span>
-                                                <span class="diag-state done" v-else>FINISHED</span>
+                                                <span class="diag-state done" v-else>DONE</span>
                                             </div>
                                         </div>
                                         <diag-timeline :events="m.timeline" :active="m.diagRunning"></diag-timeline>
@@ -812,6 +817,7 @@ const App = {
 
                                 <!-- 普通回复 -->
                                 <div v-else class="bubble-bot" :class="{ 'is-streaming': m.streaming }">
+                                    <div class="bot-tag" v-if="!m.streaming && m.content">系统回复</div>
                                     <markdown-view v-if="m.content" :content="m.content"></markdown-view>
                                     <span v-else-if="m.streaming" class="stream-cursor-row">
                                         <span class="dot-anim"><i></i><i></i><i></i></span>
@@ -819,19 +825,17 @@ const App = {
                                 </div>
 
                                 <div v-if="m.toolCalls && m.toolCalls.length" class="tool-strip">
-                                    <span v-for="(t, i) in m.toolCalls" :key="i" class="tool-chip">
-                                        <span class="tool-dot"></span>{{ t.tool }}
-                                    </span>
+                                    <span v-for="(t, i) in m.toolCalls" :key="i" class="tool-chip">{{ t.tool }}</span>
                                 </div>
 
-                                <div class="msg-meta">{{ m.type === 'aiops' ? 'AIOps Agent' : 'RAG Agent' }} · {{ fmtTime(m.ts) }}</div>
+                                <div class="msg-meta">{{ m.type === 'aiops' ? '诊断引擎' : '系统回复' }} · {{ fmtTime(m.ts) }}</div>
                             </div>
                         </template>
                     </div>
                 </div>
 
                 <!-- ========== 输入区 ========== -->
-                <div class="composer" :class="{ 'composer-raised': !hasMessages }">
+                <div class="composer">
                     <div class="composer-box">
                         <textarea
                             id="messageInput"
@@ -840,7 +844,7 @@ const App = {
                             :disabled="isBusy"
                             rows="1"
                             maxlength="1000"
-                            placeholder="描述故障现象 / 提问知识库…"
+                            placeholder="> 描述故障现象 / 提问知识库…"
                             @keydown.enter.exact.prevent="sendMessage()"
                         ></textarea>
                         <div class="composer-bar">
@@ -853,7 +857,7 @@ const App = {
                                         <button class="tools-pop-item" @click="triggerUpload">
                                             <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5l5 5M5 18h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
                                             <span>上传知识文档</span>
-                                            <span class="tp-tag">.txt / .md</span>
+                                            <span class="tp-tag">.txt/.md</span>
                                         </button>
                                     </div>
                                 </transition>
@@ -889,7 +893,7 @@ const App = {
                             </div>
                         </div>
                     </div>
-                    <div class="composer-hint">Enter 发送 · Shift+Enter 换行 ·内容由 AI 生成，请结合监控与日志复核</div>
+                    <div class="composer-hint"><span class="k">ENTER</span> 发送 · <span class="k">SHIFT+ENTER</span> 换行 · AI 生成，请结合监控复核</div>
                 </div>
             </main>
         </div>
@@ -910,7 +914,7 @@ const App = {
         <!-- ========== 通知 ========== -->
         <transition-group name="toast" tag="div" class="toast-area">
             <div v-for="n in notifications" :key="n.id" class="toast" :class="'toast-' + n.type">
-                <span class="toast-dot"></span>{{ n.message }}
+                {{ n.message }}
             </div>
         </transition-group>
 
