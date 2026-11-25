@@ -4,11 +4,16 @@
 - dashscope: langchain_qwq 的 ChatQwen 原生集成（qwen 系列）
 - deepseek:  标准的 ChatOpenAI + DeepSeek 官方 OpenAI 兼容 API
 两者都支持流式输出。
+
+对话上下文自动压缩：token 估算达到模型上下文窗口的
+RAG_CONTEXT_COMPRESS_THRESHOLD（默认 70%）时，SummarizationMiddleware
+会把较早的对话交给大模型压缩成一条摘要，最近 20 条原样保留。
 """
 
 from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
@@ -30,54 +35,37 @@ from app.agent.mcp_client import get_mcp_client_with_retry
 # 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
 # 同时也需要配置环境变量 DASHSCOPE_API_KEY=your_api_key
 
+# 各 provider 的默认上下文窗口（tokens），用于上下文压缩的阈值计算
+_PROVIDER_WINDOW_TOKENS = {
+    "deepseek": 64 * 1024,   # deepseek-chat (V3) 64k
+    "dashscope": 32 * 1024,  # qwen-max 32k
+}
+
 
 class AgentState(TypedDict):
     """Agent 状态"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-def trim_messages_middleware(state: AgentState) -> dict[str, Any] | None:
-    """
-    修剪消息历史，只保留最近的几条消息以适应上下文窗口
+class LoggingSummarizationMiddleware(SummarizationMiddleware):
+    """带日志的摘要中间件 - 压缩发生时打一条 info 日志，方便观察"""
 
-    策略：
-    - 保留第一条系统消息（System Message）
-    - 保留最近的 6 条消息（3 轮对话）
-    - 当消息少于等于 7 条时，不做修剪
+    async def abefore_model(self, state, runtime):
+        messages = state.get("messages", [])
+        total_tokens = self.token_counter(messages)
+        result = await super().abefore_model(state, runtime)
 
-    Args:
-        state: Agent 状态
-
-    Returns:
-        包含修剪后消息的字典，如果无需修剪则返回 None
-    """
-    messages = state["messages"]
-
-    # 如果消息数量较少，无需修剪
-    if len(messages) <= 7:
-        return None
-
-    # 提取第一条系统消息
-    first_msg = messages[0]
-
-    # 保留最近的 6 条消息（确保包含完整的对话轮次）
-    recent_messages = messages[-6:] if len(messages) % 2 == 0 else messages[-7:]
-
-    # 构建新的消息列表
-    new_messages = [first_msg] + list(recent_messages)
-
-    logger.debug(f"修剪消息历史: {len(messages)} -> {len(new_messages)} 条")
-
-    return {
-        "messages": [
-            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-            *new_messages
-        ]
-    }
+        if result is not None:
+            new_count = len(result.get("messages", []))
+            logger.info(
+                f"上下文压缩触发: {len(messages)} 条消息(约{total_tokens} tokens) "
+                f"-> 压缩后 {new_count} 条"
+            )
+        return result
 
 
 class RagAgentService:
-    """RAG Agent 服务 - LangGraph + 可切换提供商的生成模型"""
+    """RAG Agent 服务 - LangGraph + 可切换提供商的生成模型 + 上下文自动压缩"""
 
     def __init__(self, streaming: bool = True):
         """初始化 RAG Agent 服务
@@ -87,6 +75,12 @@ class RagAgentService:
         """
         self.streaming = streaming
         self.system_prompt = self._build_system_prompt()
+
+        # 上下文窗口（tokens）：显式配置优先，否则按 provider 取默认值
+        if config.rag_context_window_tokens > 0:
+            self.context_window = config.rag_context_window_tokens
+        else:
+            self.context_window = _PROVIDER_WINDOW_TOKENS.get("deepseek", 32 * 1024)
 
         # 按配置选择生成模型提供商
         self.provider = config.rag_llm_provider.lower()
@@ -103,15 +97,31 @@ class RagAgentService:
                 base_url=config.deepseek_base_url,
                 temperature=0.7,
                 streaming=streaming,
+                # 显式声明上下文窗口：fraction 触发器依赖它计算 70% 阈值，
+                # 不传则 profile 为 None，触发器会静默失效
+                profile={"max_input_tokens": self.context_window},
             )
         else:
             # 默认走 DashScope qwen（原行为）
             self.model_name = config.rag_model
+            self.context_window = config.rag_context_window_tokens or _PROVIDER_WINDOW_TOKENS["dashscope"]
             self.model = ChatQwen(
                 model=self.model_name,
                 api_key=config.dashscope_api_key,
                 temperature=0.7,
                 streaming=streaming,
+                profile={"max_input_tokens": self.context_window},
+            )
+
+        # 上下文压缩中间件（开关控制）
+        self.middleware = []
+        if config.rag_context_compress_enabled:
+            self.middleware.append(
+                LoggingSummarizationMiddleware(
+                    model=self.model,
+                    trigger=("fraction", config.rag_context_compress_threshold),
+                    keep=("messages", 20),  # 最近 20 条原样保留
+                )
             )
 
         # 定义基础工具
@@ -127,9 +137,12 @@ class RagAgentService:
         self.agent = None
         self._agent_initialized = False
 
+        compress_state = "on" if self.middleware else "off"
         logger.info(
             f"RAG Agent 服务初始化完成 (provider={self.provider}, "
-            f"model={self.model_name}, streaming={streaming})"
+            f"model={self.model_name}, streaming={streaming}, "
+            f"compress={compress_state}, window={self.context_window}t, "
+            f"threshold={config.rag_context_compress_threshold})"
         )
 
     async def _initialize_agent(self):
@@ -153,6 +166,10 @@ class RagAgentService:
         self.agent = create_agent(
             self.model,
             tools=all_tools,
+            # 系统提示词走参数而非塞进 messages：
+            # 框架在调模型前拼接，不进对话历史，不会被上下文压缩吞掉
+            system_prompt=self.system_prompt,
+            middleware=self.middleware,
             checkpointer=self.checkpointer,
         )
 
@@ -213,11 +230,9 @@ class RagAgentService:
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（非流式）: {question}")
 
-            # 构建消息列表（系统提示 + 用户问题）
-            messages = [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=question)
-            ]
+            # 只发用户消息：系统提示词已通过 create_agent(system_prompt=) 固定注入，
+            # 不再塞进 messages（否则每轮重复一条 SystemMessage，且会被压缩逻辑处理）
+            messages = [HumanMessage(content=question)]
 
             # 构建 Agent 输入
             agent_input = {"messages": messages}
@@ -277,11 +292,8 @@ class RagAgentService:
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（流式）: {question}")
 
-            # 构建消息列表（系统提示 + 用户问题）
-            messages = [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=question)
-            ]
+            # 只发用户消息：系统提示词由 create_agent(system_prompt=) 注入
+            messages = [HumanMessage(content=question)]
 
             # 构建 Agent 输入
             agent_input = {"messages": messages}
@@ -351,14 +363,14 @@ class RagAgentService:
         try:
             # 使用 checkpointer 的 get 方法获取最新的检查点
             config = {"configurable": {"thread_id": session_id}}
-            
+
             # 获取该 thread 的最新检查点
             checkpoint_tuple = self.checkpointer.get(config)
-            
+
             if not checkpoint_tuple:
                 logger.info(f"获取会话历史: {session_id}, 消息数量: 0")
                 return []
-            
+
             # checkpoint_tuple 可能是命名元组或普通元组，安全地提取 checkpoint
             # 通常第一个元素是 checkpoint 数据
             if hasattr(checkpoint_tuple, 'checkpoint'):
@@ -366,20 +378,26 @@ class RagAgentService:
             else:
                 # 如果是普通元组，第一个元素是 checkpoint
                 checkpoint_data = checkpoint_tuple[0] if checkpoint_tuple else {}
-            
+
             # 从检查点中提取消息
             messages = checkpoint_data.get("channel_values", {}).get("messages", [])
-            
+
             # 转换为前端需要的格式
             history = []
             for msg in messages:
                 # 跳过系统消息
                 if isinstance(msg, SystemMessage):
                     continue
-                    
+
+                # 跳过 RemoveMessage：上下文压缩后历史里会混入这种
+                # langgraph 删除指令（不是真实消息），过滤掉避免前端出现空消息
+                if isinstance(msg, RemoveMessage):
+                    continue
+
+                # 摘要消息标记为 assistant（内容是"Here is a summary..."）
                 role = "user" if isinstance(msg, HumanMessage) else "assistant"
                 content = msg.content if hasattr(msg, 'content') else str(msg)
-                
+
                 # 提取时间戳（如果有的话）
                 timestamp = getattr(msg, 'timestamp', None)
                 if timestamp:
@@ -395,10 +413,10 @@ class RagAgentService:
                         "content": content,
                         "timestamp": datetime.now().isoformat()
                     })
-            
+
             logger.info(f"获取会话历史: {session_id}, 消息数量: {len(history)}")
             return history
-            
+
         except Exception as e:
             logger.error(f"获取会话历史失败: {session_id}, 错误: {e}")
             return []
@@ -416,10 +434,10 @@ class RagAgentService:
         try:
             # 使用 checkpointer 的 delete_thread 方法删除该 thread 的所有检查点
             self.checkpointer.delete_thread(session_id)
-            
+
             logger.info(f"已清除会话历史: {session_id}")
             return True
-            
+
         except Exception as e:
             logger.error(f"清空会话历史失败: {session_id}, 错误: {e}")
             return False

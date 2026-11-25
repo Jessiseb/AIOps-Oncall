@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # RAG 生成模型提供商：dashscope（qwen，默认）/ deepseek
     rag_llm_provider: str = "deepseek"
 
+    # 对话上下文自动压缩（token 达窗口 70% 时用大模型压缩旧对话为摘要）
+    rag_context_compress_enabled: bool = True
+    rag_context_compress_threshold: float = 0.7  # 触发阈值（0~1，占模型上下文窗口比例）
+    rag_context_window_tokens: int = 0  # 模型上下文窗口 tokens；0=按 provider 自动（deepseek 64k / qwen-max 32k）
+
     # RAG 二阶段重排配置（阿里云百炼 TextReRank）
     rag_rerank_enabled: bool = True  # 总开关；重排失败时不降级、直接报错
     rag_rerank_model: str = "gte-rerank-v2"  # 百炼平台重排模型
